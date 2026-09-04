@@ -1,0 +1,131 @@
+#!/usr/bin/env python3
+"""Validate the immutable subscription token and runtime endpoint contract.
+
+The token is an identity primitive on the persistent volume. Railway endpoints
+are runtime state and may change between deployments. This contract verifies
+that the token remains valid while the served subscription exactly follows the
+current deployment endpoints, without printing any UUID, key, or short ID.
+"""
+import base64
+import hashlib
+import json
+import os
+import re
+import socket
+import sys
+import urllib.error
+import urllib.request
+from pathlib import Path
+
+D = Path(os.environ.get("DATA_DIR", "/data"))
+TOKEN_FILE = D / "subscription_token.txt"
+SUB_FILE = D / "subscription.txt"
+RUNTIME_FILE = D / "runtime.json"
+
+
+def fail(reason: str) -> None:
+    print(f"SUBSCRIPTION_CONTRACT=FAIL reason={reason}", file=sys.stderr)
+    raise SystemExit(1)
+
+
+def read(path: Path) -> str:
+    try:
+        return path.read_text().strip()
+    except OSError:
+        return ""
+
+
+def endpoint_fingerprint(public: str, tcp_host: str, tcp_port: str, nodes: int) -> str:
+    raw = f"public={public}\ntcp={tcp_host}:{tcp_port}\nnodes={nodes}".encode()
+    return hashlib.sha256(raw).hexdigest()[:16]
+
+
+def validate_lines(lines, runtime):
+    expected = int((runtime.get("nodes") or {}).get("count", 0) or 0)
+    if expected not in (5, 6):
+        fail("RUNTIME_NODE_COUNT")
+    if len(lines) != expected or any(not x.startswith("vless://") for x in lines):
+        fail("SUBSCRIPTION_LINE_COUNT_OR_FORMAT")
+
+    public = str(runtime.get("public_domain") or "").strip()
+    tcp = runtime.get("tcp_proxy") or {}
+    tcp_host = str(tcp.get("domain") or "").strip()
+    tcp_port = str(tcp.get("port") or "").strip()
+    if not public or not tcp_host or not tcp_port:
+        fail("CURRENT_ENDPOINT_STATE")
+
+    if not re.match(rf"^vless://[^@]+@{re.escape(public)}:443\?", lines[0]):
+        fail("NODE1_PUBLIC_ENDPOINT")
+    if not re.match(rf"^vless://[^@]+@{re.escape(public)}:443\?", lines[1]):
+        fail("NODE2_PUBLIC_ENDPOINT")
+    for idx in (2, 3, 4):
+        if not re.match(rf"^vless://[^@]+@{re.escape(tcp_host)}:{re.escape(tcp_port)}\?", lines[idx]):
+            fail(f"NODE{idx+1}_TCP_ENDPOINT")
+
+    if expected == 6:
+        cf = runtime.get("cloudflare") or {}
+        cf_host = str(cf.get("public_hostname") or "").strip()
+        if not cf_host or not re.match(rf"^vless://[^@]+@{re.escape(cf_host)}:443\?", lines[5]):
+            fail("NODE6_CLOUDFLARE_ENDPOINT")
+
+    return expected, public, tcp_host, tcp_port
+
+
+def main():
+    token = read(TOKEN_FILE)
+    if not (20 <= len(token) <= 256) or not re.fullmatch(r"[A-Za-z0-9_-]+", token):
+        fail("TOKEN_INVALID")
+    if not RUNTIME_FILE.is_file() or not SUB_FILE.is_file():
+        fail("RUNTIME_OR_SUBSCRIPTION_MISSING")
+
+    try:
+        runtime = json.loads(RUNTIME_FILE.read_text())
+    except Exception:
+        fail("RUNTIME_JSON_INVALID")
+    lines = [x.strip() for x in SUB_FILE.read_text().splitlines() if x.strip()]
+    expected, public, tcp_host, tcp_port = validate_lines(lines, runtime)
+
+    # Contract version is derived only from non-secret subscription semantics.
+    contract_material = {
+        "schema": 1,
+        "nodes": expected,
+        "public_domain": public,
+        "tcp_proxy": f"{tcp_host}:{tcp_port}",
+        "cloudflare": bool((runtime.get("cloudflare") or {}).get("enabled")),
+    }
+    version = hashlib.sha256(json.dumps(contract_material, sort_keys=True, separators=(",", ":")).encode()).hexdigest()[:16]
+    epfp = endpoint_fingerprint(public, tcp_host, tcp_port, expected)
+
+    # Verify the gateway's subscription URL locally. The token itself is never logged.
+    gateway_port = int(os.environ.get("GATEWAY_PORT", "8080"))
+    url = f"http://127.0.0.1:{gateway_port}/sub/{token}"
+    try:
+        with urllib.request.urlopen(url, timeout=5) as response:
+            if response.status != 200:
+                fail(f"HTTP_STATUS_{response.status}")
+            raw = response.read()
+    except (urllib.error.URLError, TimeoutError, OSError) as exc:
+        fail(f"HTTP_LOCAL_ACCESS_{type(exc).__name__}")
+
+    try:
+        decoded = base64.b64decode(raw, validate=True).decode()
+    except Exception:
+        fail("HTTP_PAYLOAD_NOT_BASE64")
+    served = [x.strip() for x in decoded.splitlines() if x.strip()]
+    if served != lines:
+        fail("HTTP_PAYLOAD_MISMATCH")
+    validate_lines(served, runtime)
+
+    print("SUBSCRIPTION_TOKEN_STATE=REUSED")
+    print("SUBSCRIPTION_TOKEN_SECRET=REDACTED")
+    print("SUBSCRIPTION_HTTP_LOCAL=PASS")
+    print("SUBSCRIPTION_ENDPOINT_CONTRACT=PASS")
+    print(f"SUBSCRIPTION_VERSION={version}")
+    print(f"SUBSCRIPTION_ENDPOINT_FINGERPRINT={epfp}")
+    print(f"SUBSCRIPTION_ENDPOINT_STATE=public={public} tcp={tcp_host}:{tcp_port} nodes={expected}")
+    print("SUBSCRIPTION_SECRETS_EXPOSED=NO")
+    print("SUBSCRIPTION_CONTRACT=PASS")
+
+
+if __name__ == "__main__":
+    main()

@@ -3,15 +3,15 @@
 
 The token is an identity primitive on the persistent volume. Railway endpoints
 are runtime state and may change between deployments. This contract verifies
-that the token remains valid while the served subscription exactly follows the
-current deployment endpoints, without printing any UUID, key, or short ID.
+that the token remains sealed to the persistent identity while the served
+subscription exactly follows the current deployment endpoints, without printing
+any UUID, key, or short ID.
 """
 import base64
 import hashlib
 import json
 import os
 import re
-import socket
 import sys
 import urllib.error
 import urllib.request
@@ -19,6 +19,7 @@ from pathlib import Path
 
 D = Path(os.environ.get("DATA_DIR", "/data"))
 TOKEN_FILE = D / "subscription_token.txt"
+SEAL_FILE = D / "identity-integrity.json"
 SUB_FILE = D / "subscription.txt"
 RUNTIME_FILE = D / "runtime.json"
 
@@ -33,6 +34,28 @@ def read(path: Path) -> str:
         return path.read_text().strip()
     except OSError:
         return ""
+
+
+def file_sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as fh:
+        for chunk in iter(lambda: fh.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def verify_token_sealed(token: str) -> None:
+    if not SEAL_FILE.is_file():
+        fail("IDENTITY_SEAL_MISSING")
+    try:
+        seal = json.loads(SEAL_FILE.read_text())
+        expected = (seal.get("files") or {}).get(TOKEN_FILE.name, "")
+    except Exception:
+        fail("IDENTITY_SEAL_INVALID")
+    if seal.get("schema") != 1 or not expected:
+        fail("IDENTITY_SEAL_INVALID")
+    if file_sha256(TOKEN_FILE) != expected:
+        fail("TOKEN_SEAL_MISMATCH")
 
 
 def endpoint_fingerprint(public: str, tcp_host: str, tcp_port: str, nodes: int) -> str:
@@ -75,6 +98,7 @@ def main():
     token = read(TOKEN_FILE)
     if not (20 <= len(token) <= 256) or not re.fullmatch(r"[A-Za-z0-9_-]+", token):
         fail("TOKEN_INVALID")
+    verify_token_sealed(token)
     if not RUNTIME_FILE.is_file() or not SUB_FILE.is_file():
         fail("RUNTIME_OR_SUBSCRIPTION_MISSING")
 
@@ -117,6 +141,7 @@ def main():
     validate_lines(served, runtime)
 
     print("SUBSCRIPTION_TOKEN_STATE=REUSED")
+    print("SUBSCRIPTION_TOKEN_SEALED=PASS")
     print("SUBSCRIPTION_TOKEN_SECRET=REDACTED")
     print("SUBSCRIPTION_HTTP_LOCAL=PASS")
     print("SUBSCRIPTION_ENDPOINT_CONTRACT=PASS")

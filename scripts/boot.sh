@@ -25,8 +25,22 @@ if [ -n "${RAILWAY_TOKEN:-}" ] || [ -n "${RAILWAY_API_TOKEN:-}" ]; then
     exit 10
   fi
   if [ "$API_SETUP_RC" -ne 0 ]; then
-    echo "FATAL: Railway API networking setup failed; refusing to generate incomplete nodes" >&2
-    exit 1
+    # Railway's injected runtime endpoints are authoritative. A control-plane
+    # authorization/API failure must not kill a deployment that already has a
+    # complete public domain and TCP proxy endpoint.
+    RUNTIME_PUBLIC="${RAILWAY_PUBLIC_DOMAIN:-}"
+    RUNTIME_TCP_HOST="${RAILWAY_TCP_PROXY_DOMAIN:-}"
+    RUNTIME_TCP_PORT="${RAILWAY_TCP_PROXY_PORT:-}"
+    RUNTIME_ENDPOINTS_OK=1
+    case "$RUNTIME_TCP_PORT" in ''|*[!0-9]*) RUNTIME_ENDPOINTS_OK=0;; esac
+    case "$RUNTIME_PUBLIC" in *.up.railway.app) :;; *) RUNTIME_ENDPOINTS_OK=0;; esac
+    case "$RUNTIME_TCP_HOST" in *.proxy.rlwy.net) :;; *) RUNTIME_ENDPOINTS_OK=0;; esac
+    if [ "$RUNTIME_ENDPOINTS_OK" -eq 1 ] && [ "$RUNTIME_TCP_PORT" -ge 1 ] && [ "$RUNTIME_TCP_PORT" -le 65535 ]; then
+      echo "RAILWAY_API_SETUP=CONTINUE_RUNTIME_ENDPOINTS reason=control_plane_unavailable"
+    else
+      echo "FATAL: Railway API networking setup failed and runtime endpoints are incomplete" >&2
+      exit 1
+    fi
   fi
 fi
 
@@ -107,9 +121,6 @@ if [ "$TCP_PROXY_CONNECTIVITY" = "READY" ] && [ "$TCP_PROXY_SETTLE_SECONDS" -gt 
 echo "TCP_PROXY_DOMAIN=${TCP_HOST}"; echo "TCP_PROXY_PORT=${TCP_PORT}"; echo "TCP_PROXY_TARGET_PORT=8080"; echo "TCP_PROXY_DNS=${TCP_PROXY_DNS}"; echo "TCP_PROXY_CONNECTIVITY=${TCP_PROXY_CONNECTIVITY}"; echo "TCP_PROXY_PROBE_SECONDS=${TCP_PROXY_PROBE_ELAPSED}"; echo "TCP_PROXY_SELF_CONNECTIVITY=${TCP_PROXY_CONNECTIVITY}"; echo "TCP_PROXY_EXTERNAL_PATH=UNVERIFIED"; echo "NETWORKING_STATE=READY"
 python3 /opt/xray/scripts/runtime-manifest.py; python3 /opt/xray/scripts/generate.py
 
-# Hard guarantee: the subscription URL is rebuilt from the persisted token and
-# the current Railway public domain on every successful startup. It is runtime
-# state, never an identity source, and is therefore safe to regenerate.
 SUBSCRIPTION_URL_FILE="$D/subscription_url.txt"
 EXPECTED_SUBSCRIPTION_URL="https://${PUBLIC_DOMAIN}/sub/${TOKEN}"
 printf '%s\n' "$EXPECTED_SUBSCRIPTION_URL" >"$SUBSCRIPTION_URL_FILE.tmp"

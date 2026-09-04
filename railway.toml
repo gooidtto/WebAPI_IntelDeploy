@@ -1,0 +1,10 @@
+[build]
+builder = "DOCKERFILE"
+
+[deploy]
+# /health is liveness and is intentionally available from the early gateway bind.
+# boot.sh blocks completion until runtime/subscription/Xray readiness is verified.
+healthcheckPath = "/health"
+healthcheckTimeout = 30
+restartPolicyType = "ON_FAILURE"
+restartPolicyMaxRetries = 10

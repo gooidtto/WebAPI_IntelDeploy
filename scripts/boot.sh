@@ -9,18 +9,14 @@ export RELEASE="$REPOSITORY_IDENTITY" BUILD_ID="$REPOSITORY_IDENTITY" SOURCE_BUI
 D="${RAILWAY_VOLUME_MOUNT_PATH:-${DATA_DIR:-/data}}"
 export DATA_DIR="$D"
 
-# Hard precondition: identity-init.py verifies that D is a real mounted
-# persistent volume before any identity or runtime data is touched.
 python3 /opt/xray/scripts/identity-init.py
 echo "NODE_IDENTITY_POLICY=INITIALIZE_ONCE_REUSE_FOREVER"
 
-# Gateway early bind: keep Railway target port 8080 alive before
-# networking/runtime/Xray readiness work begins.
+# Bind the gateway before Railway networking/Xray readiness. Keep its durable
+# log on the volume, and mirror it to the deployment log stream for diagnostics.
 python3 /opt/xray/scripts/gateway.py >"$D/gateway.log" 2>&1 & GP=$!
+tail -n 0 -F "$D/gateway.log" 2>/dev/null & GLP=$!
 
-# Railway networking is runtime state and must be reconciled on every startup.
-# In particular, this removes duplicate Railway-provided .up.railway.app
-# service domains instead of creating another one. Identity is never changed.
 if [ -n "${RAILWAY_TOKEN:-}" ] || [ -n "${RAILWAY_API_TOKEN:-}" ]; then
   set +e
   python3 /opt/xray/scripts/railway_setup.py
@@ -28,8 +24,6 @@ if [ -n "${RAILWAY_TOKEN:-}" ] || [ -n "${RAILWAY_API_TOKEN:-}" ]; then
   set -e
   if [ "$API_SETUP_RC" -eq 10 ]; then
     echo "RAILWAY_API_REDEPLOY=REQUESTED"
-    # Networking was reconciled and a redeploy was requested. Exit non-zero so
-    # Railway does not leave this pre-reconciliation deployment running.
     exit 10
   fi
   if [ "$API_SETUP_RC" -ne 0 ]; then
@@ -42,9 +36,6 @@ PUBLIC_DOMAIN="${RAILWAY_PUBLIC_DOMAIN:-}"
 TCP_HOST="${RAILWAY_TCP_PROXY_DOMAIN:-}"
 TCP_PORT="${RAILWAY_TCP_PROXY_PORT:-}"
 
-# Fresh Railway projects can start the container before Networking has fully
-# settled. Keep the liveness Gateway available, then use a bounded retry window
-# before declaring the deployment unusable. Persisted endpoints are never used.
 NETWORK_DISCOVERY_TIMEOUT="${RAILWAY_NETWORK_DISCOVERY_TIMEOUT:-180}"
 NETWORK_DISCOVERY_INTERVAL="${RAILWAY_NETWORK_DISCOVERY_INTERVAL:-3}"
 NETWORK_DISCOVERY_ELAPSED=0
@@ -65,7 +56,7 @@ echo "RAILWAY_NETWORK_DISCOVERY=READY elapsed=${NETWORK_DISCOVERY_ELAPSED}s"
 case "$TCP_PORT" in ''|*[!0-9]*) echo "FATAL: RAILWAY_TCP_PROXY_PORT must be numeric" >&2; exit 1;; esac
 [ "$TCP_PORT" -ge 1 ] && [ "$TCP_PORT" -le 65535 ] || { echo "FATAL: Railway TCP Proxy port out of range" >&2; exit 1; }
 
-# Current deployment networking wins over every persisted runtime artifact.
+# Endpoints are runtime state. Never restore them from /data.
 for f in "$D/runtime.json" "$D/state.json" "$D/manifest.json" "$D/runtime-manifest.json" "$D/subscription.txt" "$D/subscription.txt.tmp" "$D/subscription_url.txt" "${XRAY_CONFIG:-$D/config.json}"; do
   rm -f "$f"
 done
@@ -76,7 +67,6 @@ export RAILWAY_NETWORKING_SOURCE=current-deployment-environment
 export RAILWAY_NETWORKING_AUTHORITATIVE=true
 export RAILWAY_TCP_PROXY_DOMAIN="$TCP_HOST" RAILWAY_TCP_PROXY_PORT="$TCP_PORT" PUBLIC_DOMAIN="$PUBLIC_DOMAIN"
 
-# Identity values are read-only inputs here. No runtime component generates or replaces them.
 UUID_FILE="$D/uuid.txt"
 PRIV_FILE="$D/reality_private_key.txt"; PUB_FILE="$D/reality_public_key.txt"; TOKEN_FILE="$D/subscription_token.txt"
 [ -s "$UUID_FILE" ] && [ -s "$PRIV_FILE" ] && [ -s "$PUB_FILE" ] && [ -s "$TOKEN_FILE" ] || {
@@ -98,7 +88,7 @@ export REALITY_GRPC_SNI="${REALITY_GRPC_SNI:-www.bing.com}" REALITY_GRPC_TARGET=
 export GRPC_SERVICE_NAME="${GRPC_SERVICE_NAME:-grpc-service}" XHTTP_PATH="${XHTTP_PATH:-/xhttp}" WS_PATH="${WS_PATH:-/ws}"
 CF_TOKEN="${CLOUDFLARE_TUNNEL_TOKEN:-${CF_TUNNEL_TOKEN:-${TUNNEL_TOKEN:-}}}"; CF_ID="${CLOUDFLARE_TUNNEL_ID:-${CF_TUNNEL_ID:-${TUNNEL_ID:-}}}"; CF_HOST="${CLOUDFLARE_PUBLIC_HOSTNAME:-${CF_PUBLIC_HOSTNAME:-}}"; CF_ORIGIN="${CLOUDFLARE_ORIGIN_SERVICE:-${CF_ORIGIN_SERVICE:-}}"; CF_PORT="${CLOUDFLARE_XHTTP_PORT:-${CF_XHTTP_PORT:-}}"; CF_PATH="${CLOUDFLARE_XHTTP_PATH:-${CF_XHTTP_PATH:-}}"
 export CLOUDFLARE_TUNNEL_TOKEN="$CF_TOKEN" CLOUDFLARE_TUNNEL_ID="$CF_ID" CLOUDFLARE_PUBLIC_HOSTNAME="$CF_HOST" CLOUDFLARE_ORIGIN_SERVICE="$CF_ORIGIN" CLOUDFLARE_XHTTP_PORT="$CF_PORT" CLOUDFLARE_XHTTP_PATH="$CF_PATH"
-XP=""; CFP=""; cleanup(){ kill "$XP" "$GP" "$CFP" 2>/dev/null || true; wait "$XP" 2>/dev/null || true; wait "$GP" 2>/dev/null || true; wait "$CFP" 2>/dev/null || true; }; trap cleanup INT TERM EXIT
+XP=""; CFP=""; cleanup(){ kill "$XP" "$GP" "$GLP" "$CFP" 2>/dev/null || true; wait "$XP" 2>/dev/null || true; wait "$GP" 2>/dev/null || true; wait "$GLP" 2>/dev/null || true; wait "$CFP" 2>/dev/null || true; }; trap cleanup INT TERM EXIT
 sleep 1; kill -0 "$GP" 2>/dev/null || { echo "FATAL: gateway failed to bind 8080" >&2; tail -80 "$D/gateway.log" >&2 || true; exit 1; }; echo "GATEWAY_BIND_EARLY=PASS port=8080"; echo "HEALTH_ENDPOINT=PASS path=/health"
 TCP_HOST="${RAILWAY_TCP_PROXY_DOMAIN}"; TCP_PORT="${RAILWAY_TCP_PROXY_PORT}"; TCP_CHECK_SECONDS="${TCP_PROXY_CHECK_SECONDS:-20}"; TCP_CHECK_INTERVAL="${TCP_PROXY_CHECK_INTERVAL:-2}"; TCP_PROXY_SETTLE_SECONDS="${TCP_PROXY_SETTLE_SECONDS:-30}"
 tcp_proxy_probe(){ python3 - "$TCP_HOST" "$TCP_PORT" <<'PY2'
@@ -144,8 +134,6 @@ wait_port 127.0.0.1 10086 xhttp-http; wait_port 127.0.0.1 10090 ws-http; wait_po
 
 echo "========== DEPLOYMENT SUMMARY =========="; echo "RELEASE=$BUILD_ID"; echo "NODE_IDENTITY_POLICY=INITIALIZE_ONCE_REUSE_FOREVER"; echo "RAILWAY_NETWORKING_SOURCE=current-deployment-environment"; echo "RAILWAY_NETWORKING_AUTHORITATIVE=true"; echo "RAILWAY_TCP_PROXY_TARGET_PORT=8080"; echo "GATEWAY_BIND_EARLY=PASS"; echo "NODES=$(python3 -c 'import json;print(json.load(open("'"$RUNTIME"'"))["nodes"]["count"])')"; echo "SUBSCRIPTION_CHECK=PASS"; echo "XRAY=READY"; if [ "$CF_ENABLED" = "1" ]; then echo "NODE6=VLESS_XHTTP_TLS_CLOUDFLARE"; echo "CLOUDFLARE_TUNNEL=READY"; fi; echo "========================================"
 
-# Keep PID 1 alive and restart the whole container through Railway if either
-# primary process exits. No process here changes Railway variables or identity.
 while true; do
   if ! kill -0 "$GP" 2>/dev/null; then echo "FATAL: Gateway process exited; restarting container" >&2; exit 1; fi
   if ! kill -0 "$XP" 2>/dev/null; then echo "FATAL: Xray process exited; restarting container" >&2; exit 1; fi

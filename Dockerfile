@@ -30,7 +30,7 @@ RUN set -eu; \
     check subscription_contract_present test -f /opt/xray/scripts/subscription-contract.py; \
     check persistent_volume_guard grep -q 'not a mounted persistent volume' /opt/xray/scripts/identity-init.py; \
     check identity_reuse grep -q 'emit_identity_status("REUSED")' /opt/xray/scripts/identity-init.py; \
-    check identity_fail_closed grep -q 'refusing to rotate identity' /opt/xray/scripts/identity-init.py; \
+    check identity_fail_closed grep -q 'refusing to regenerate identity' /opt/xray/scripts/identity-init.py; \
     check identity_integrity_seal grep -q 'identity-integrity.json' /opt/xray/scripts/identity-init.py; \
     check subscription_token_sealed grep -q 'TOKEN_SEAL_MISMATCH' /opt/xray/scripts/subscription-contract.py; \
     check subscription_http_contract grep -q 'SUBSCRIPTION_HTTP_LOCAL=PASS' /opt/xray/scripts/subscription-contract.py; \
@@ -56,9 +56,11 @@ RUN set -eu; \
     check cloudflare_xhttp_tls grep -q 'cloudflare-xhttp-tls' /opt/xray/scripts/generate.py; \
     check tcp_proxy_target grep -q 'tcp_proxy_expected_target\":8080' /opt/xray/scripts/runtime-manifest.py; \
     check networking_domain_count grep -q 'RAILWAY_API_PUBLIC_DOMAIN_CONFIG_COUNT=' /opt/xray/scripts/railway_setup.py; \
-    check networking_domain_reconcile grep -q 'RAILWAY_API_PUBLIC_DOMAIN=RECONCILED count=1' /opt/xray/scripts/railway_setup.py; \
+    check networking_domain_safe_mode grep -q 'Non-destructive' /opt/xray/scripts/railway_setup.py; \
     check networking_tcp_count grep -q 'RAILWAY_API_TCP_PROXY_CONFIG_COUNT=' /opt/xray/scripts/railway_setup.py; \
-    check networking_tcp_reconcile grep -q 'RAILWAY_API_TCP_PROXY=RECONCILED target=8080 count=1' /opt/xray/scripts/railway_setup.py; \
+    check networking_tcp_safe_mode grep -q 'Do not destructively delete' /opt/xray/scripts/railway_setup.py; \
+    check networking_runtime_fallback grep -q 'RAILWAY_API_SETUP=CONTINUE_RUNTIME_ENDPOINTS' /opt/xray/scripts/railway_setup.py; \
+    check railway_auth_fallback grep -q 'BEARER_FALLBACK' /opt/xray/scripts/railway_setup.py; \
     check ws_transport_present grep -q '"network": "ws"' /opt/xray/scripts/generate.py; \
     check ws_subscription_present grep -q '"type":"ws"' /opt/xray/scripts/generate.py; \
     check ws_gateway_route grep -q 'http-websocket' /opt/xray/scripts/gateway.py; \

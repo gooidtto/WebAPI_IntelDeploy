@@ -1,11 +1,10 @@
 #!/usr/bin/env python3
-"""Idempotent Railway networking bootstrap.
+"""Idempotent Railway runtime networking bootstrap.
 
-This module owns runtime networking only:
-  Railway service domain -> HTTP/TLS gateway on :8080
-  Railway TCP proxy -> TCP gateway on :8080
-
-It never creates, rotates, repairs, or otherwise changes node identity.
+Railway API is an optional control-plane enhancement. The runtime-provided
+network variables remain authoritative for the running deployment. An API
+failure is therefore non-fatal when the current public/TCP endpoints are
+already complete and valid; it remains fatal when endpoints are unavailable.
 """
 import json
 import os
@@ -18,7 +17,6 @@ API_URL = "https://backboard.railway.com/graphql/v2"
 TARGET_PORT = 8080
 API_RETRIES = max(1, int(os.environ.get("RAILWAY_API_RETRIES", "3")))
 API_RETRY_DELAY = max(1.0, float(os.environ.get("RAILWAY_API_RETRY_DELAY", "2.5")))
-
 PROJECT_TOKEN = os.environ.get("RAILWAY_TOKEN", "").strip()
 ACCOUNT_TOKEN = os.environ.get("RAILWAY_API_TOKEN", "").strip()
 PROJECT_ID = os.environ.get("RAILWAY_PROJECT_ID", "").strip()
@@ -31,25 +29,29 @@ class ApiError(RuntimeError):
     pass
 
 
+def runtime_endpoints_complete():
+    public = os.environ.get("RAILWAY_PUBLIC_DOMAIN", "").strip()
+    host = os.environ.get("RAILWAY_TCP_PROXY_DOMAIN", "").strip()
+    port = os.environ.get("RAILWAY_TCP_PROXY_PORT", "").strip()
+    if not public or not host or not port or not public.endswith(".up.railway.app") or not host.endswith(".proxy.rlwy.net"):
+        return False
+    try:
+        return 1 <= int(port) <= 65535
+    except ValueError:
+        return False
+
+
 def _request_once(query, variables, mode, token):
     headers = {"Content-Type": "application/json", "User-Agent": "railway-universal-stable/5.6"}
-    headers["Project-Access-Token" if mode == "project" else "Authorization"] = (
-        token if mode == "project" else f"Bearer {token}"
-    )
-    req = urllib.request.Request(
-        API_URL,
-        data=json.dumps({"query": query, "variables": variables or {}}).encode(),
-        headers=headers,
-        method="POST",
-    )
+    headers["Project-Access-Token" if mode == "project" else "Authorization"] = token if mode == "project" else f"Bearer {token}"
+    req = urllib.request.Request(API_URL, data=json.dumps({"query": query, "variables": variables or {}}).encode(), headers=headers, method="POST")
     try:
         with urllib.request.urlopen(req, timeout=15) as resp:
             body = json.loads(resp.read().decode())
     except urllib.error.HTTPError as exc:
         detail = exc.read().decode(errors="replace")
         err = ApiError(f"HTTP {exc.code}: {detail[:500]}")
-        if exc.code == 429 or 500 <= exc.code <= 599:
-            err.retryable = True
+        err.retryable = exc.code == 429 or 500 <= exc.code <= 599
         raise err
     except (urllib.error.URLError, TimeoutError, OSError) as exc:
         err = ApiError(f"request failed: {exc}")
@@ -66,7 +68,7 @@ def _request(query, variables, mode, token):
     last = None
     for attempt in range(1, API_RETRIES + 1):
         try:
-            return _request_once(query, variables or {}, mode, token)
+            return _request_once(query, variables, mode, token)
         except ApiError as exc:
             last = exc
             if not getattr(exc, "retryable", False) or attempt >= API_RETRIES:
@@ -84,7 +86,6 @@ def gql(query, variables=None):
         if not token:
             raise ApiError(f"configured Railway auth mode {AUTH_MODE} has no token")
         return _request(query, variables, AUTH_MODE, token)
-
     errors = []
     if PROJECT_TOKEN:
         try:
@@ -93,7 +94,6 @@ def gql(query, variables=None):
             return data
         except ApiError as exc:
             errors.append(exc)
-
     if ACCOUNT_TOKEN and ACCOUNT_TOKEN != PROJECT_TOKEN:
         try:
             data = _request(query, variables, "bearer", ACCOUNT_TOKEN)
@@ -102,17 +102,14 @@ def gql(query, variables=None):
             return data
         except ApiError as exc:
             errors.append(exc)
-
-    if errors:
-        raise errors[-1]
-    raise ApiError("no Railway token")
+    raise errors[-1] if errors else ApiError("no Railway token")
 
 
 def resolve_ids():
     global PROJECT_ID, ENVIRONMENT_ID, SERVICE_ID
     if not PROJECT_ID or not ENVIRONMENT_ID:
         if not PROJECT_TOKEN:
-            raise ApiError("Railway project/environment IDs are unavailable; set RAILWAY_PROJECT_ID and RAILWAY_ENVIRONMENT_ID when using account-token fallback")
+            raise ApiError("Railway project/environment IDs are unavailable; provide RAILWAY_PROJECT_ID and RAILWAY_ENVIRONMENT_ID when using account-token fallback")
         data = gql("query { projectToken { projectId environmentId } }")
         info = data.get("projectToken") or {}
         PROJECT_ID = PROJECT_ID or str(info.get("projectId", ""))
@@ -120,10 +117,7 @@ def resolve_ids():
     if not PROJECT_ID or not ENVIRONMENT_ID:
         raise ApiError("unable to resolve Railway project/environment ID")
     if not SERVICE_ID:
-        data = gql(
-            """query($id:String!){ project(id:$id){ services{edges{node{id name}}} } }""",
-            {"id": PROJECT_ID},
-        )
+        data = gql("query($id:String!){ project(id:$id){ services{edges{node{id name}}} } }", {"id": PROJECT_ID})
         services = (((data.get("project") or {}).get("services") or {}).get("edges") or [])
         wanted = os.environ.get("RAILWAY_SERVICE_NAME", "").strip()
         matches = [e["node"] for e in services if e.get("node", {}).get("name") == wanted]
@@ -135,7 +129,7 @@ def resolve_ids():
             raise ApiError("unable to identify target Railway service")
 
 
-def _normalize_domain_entries(raw):
+def _normalize_domains(raw):
     result = []
     if isinstance(raw, dict):
         for key, value in raw.items():
@@ -143,150 +137,76 @@ def _normalize_domain_entries(raw):
             if not key:
                 continue
             if isinstance(value, dict):
-                domain = str(value.get("domain", "")).strip()
-                if not domain and key.endswith(".up.railway.app"):
-                    domain = key
+                domain = str(value.get("domain", "")).strip() or (key if key.endswith(".up.railway.app") else "")
                 if domain:
                     result.append({"id": key if not key.endswith(".up.railway.app") else "", "domain": domain, "config_key": key})
             elif isinstance(value, str) and value.strip():
                 result.append({"id": key, "domain": value.strip(), "config_key": key})
     elif isinstance(raw, list):
         for value in raw:
-            if not isinstance(value, dict):
-                continue
-            domain = str(value.get("domain", "")).strip()
-            domain_id = str(value.get("id", "")).strip()
-            if domain:
-                result.append({"id": domain_id, "domain": domain, "config_key": domain_id})
+            if isinstance(value, dict) and str(value.get("domain", "")).strip():
+                result.append({"id": str(value.get("id", "")).strip(), "domain": str(value["domain"]).strip(), "config_key": str(value.get("id", "")).strip()})
     return result
 
 
 def list_service_domains():
-    data = gql(
-        """query($id:String!){ environment(id:$id){ config(decryptVariables:false) } }""",
-        {"id": ENVIRONMENT_ID},
-    )
+    data = gql("query($id:String!){ environment(id:$id){ config(decryptVariables:false) } }", {"id": ENVIRONMENT_ID})
     config = ((data.get("environment") or {}).get("config")) or {}
     if isinstance(config, str):
-        try:
-            config = json.loads(config)
-        except Exception as exc:
-            raise ApiError(f"unable to parse Railway environment config: {exc}")
+        config = json.loads(config)
     service_cfg = ((config.get("services") or {}).get(SERVICE_ID)) or {}
-    networking = service_cfg.get("networking") or {}
-    domains = _normalize_domain_entries(networking.get("serviceDomains") or {})
+    domains = _normalize_domains((service_cfg.get("networking") or {}).get("serviceDomains") or {})
     print(f"RAILWAY_API_PUBLIC_DOMAIN_CONFIG_COUNT={len(domains)}")
-    if domains:
-        print("RAILWAY_API_PUBLIC_DOMAIN_CONFIG=" + ",".join(d["domain"] for d in domains))
     return domains
-
-
-def delete_service_domain(domain_id, domain, config_key=""):
-    print(f"RAILWAY_API_ACTION=DELETE_DUPLICATE_PUBLIC_DOMAIN domain={domain}")
-    if domain_id:
-        gql("""mutation($id:String!){ serviceDomainDelete(id:$id) }""", {"id": domain_id})
-    elif config_key:
-        gql(
-            """mutation($environmentId:String!,$patch:EnvironmentConfig,$commitMessage:String){
-                 environmentPatchCommit(environmentId:$environmentId,patch:$patch,commitMessage:$commitMessage)
-               }""",
-            {
-                "environmentId": ENVIRONMENT_ID,
-                "patch": {"services": {SERVICE_ID: {"networking": {"serviceDomains": {config_key: None}}}}},
-                "commitMessage": "Remove duplicate Railway service domain",
-            },
-        )
-    else:
-        raise ApiError(f"duplicate Railway domain has no deletion key: {domain}")
-    print(f"RAILWAY_API_PUBLIC_DOMAIN=DELETED domain={domain}")
 
 
 def create_service_domain():
     print("RAILWAY_API_ACTION=CREATE_PUBLIC_DOMAIN")
-    result = gql(
-        """mutation($input:ServiceDomainCreateInput!){ serviceDomainCreate(input:$input){domain} }""",
-        {"input": {"serviceId": SERVICE_ID, "environmentId": ENVIRONMENT_ID}},
-    )
+    result = gql("mutation($input:ServiceDomainCreateInput!){ serviceDomainCreate(input:$input){domain} }", {"input": {"serviceId": SERVICE_ID, "environmentId": ENVIRONMENT_ID}})
     domain = (result.get("serviceDomainCreate") or {}).get("domain", "")
     if not domain:
         raise ApiError("serviceDomainCreate returned an empty domain")
     print(f"RAILWAY_API_PUBLIC_DOMAIN=CREATED domain={domain}")
 
 
-def _normalize_tcp_proxies(raw):
-    result = []
-    for proxy in raw or []:
-        if not isinstance(proxy, dict):
+def _normalize_tcp(raw):
+    out = []
+    for p in raw or []:
+        if not isinstance(p, dict):
             continue
-        try:
-            application_port = int(proxy.get("applicationPort", -1))
-            proxy_port = int(proxy.get("proxyPort", -1))
-        except (TypeError, ValueError):
-            application_port = -1
-            proxy_port = -1
-        result.append({
-            "id": str(proxy.get("id", "")).strip(),
-            "domain": str(proxy.get("domain", "")).strip(),
-            "proxyPort": proxy_port,
-            "applicationPort": application_port,
-        })
-    return result
-
-
-def delete_tcp_proxy(proxy):
-    proxy_id = proxy.get("id", "")
-    if not proxy_id:
-        raise ApiError("Railway TCP proxy has no deletion id")
-    print(f"RAILWAY_API_ACTION=DELETE_DUPLICATE_TCP_PROXY domain={proxy.get('domain','')} port={proxy.get('proxyPort','')}")
-    gql("""mutation($id:String!){ tcpProxyDelete(id:$id) }""", {"id": proxy_id})
-    print(f"RAILWAY_API_TCP_PROXY=DELETED id={proxy_id}")
+        try: app = int(p.get("applicationPort", -1)); port = int(p.get("proxyPort", -1))
+        except (TypeError, ValueError): app = port = -1
+        out.append({"id": str(p.get("id", "")).strip(), "domain": str(p.get("domain", "")).strip(), "proxyPort": port, "applicationPort": app})
+    return out
 
 
 def ensure_tcp_proxy():
-    raw = gql(
-        """query($serviceId:String!,$environmentId:String!){
-             tcpProxies(serviceId:$serviceId,environmentId:$environmentId){id domain proxyPort applicationPort}
-           }""",
-        {"serviceId": SERVICE_ID, "environmentId": ENVIRONMENT_ID},
-    ).get("tcpProxies") or []
-    normalized = _normalize_tcp_proxies(raw)
-    target = [p for p in normalized if p["applicationPort"] == TARGET_PORT]
-    print(f"RAILWAY_API_TCP_PROXY_CONFIG_COUNT={len(normalized)}")
-    if normalized:
-        print("RAILWAY_API_TCP_PROXY_CONFIG=" + ",".join(
-            f"{p['domain']}:{p['proxyPort']}->{p['applicationPort']}" for p in normalized
-        ))
-
+    data = gql("query($serviceId:String!,$environmentId:String!){ tcpProxies(serviceId:$serviceId,environmentId:$environmentId){id domain proxyPort applicationPort} }", {"serviceId": SERVICE_ID, "environmentId": ENVIRONMENT_ID})
+    proxies = _normalize_tcp(data.get("tcpProxies") or [])
+    target = [p for p in proxies if p["applicationPort"] == TARGET_PORT]
+    print(f"RAILWAY_API_TCP_PROXY_CONFIG_COUNT={len(proxies)}")
+    env_host = os.environ.get("RAILWAY_TCP_PROXY_DOMAIN", "").strip()
+    env_port = os.environ.get("RAILWAY_TCP_PROXY_PORT", "").strip()
     if len(target) > 1:
-        keep = next((p for p in target if p["domain"] == os.environ.get("RAILWAY_TCP_PROXY_DOMAIN", "").strip()), target[0])
+        keep = next((p for p in target if p["domain"] == env_host), target[0])
         print(f"RAILWAY_API_TCP_PROXY=DUPLICATES count={len(target)} keep={keep['domain']}:{keep['proxyPort']}")
-        for proxy in target:
-            if proxy is keep:
-                continue
-            delete_tcp_proxy(proxy)
-        print("RAILWAY_API_TCP_PROXY=RECONCILED target=8080 count=1")
-        return True
-
-    if len(target) == 1:
-        proxy = target[0]
-        if not proxy["domain"] or not (1 <= proxy["proxyPort"] <= 65535):
-            raise ApiError("Railway TCP proxy targeting 8080 has invalid domain or proxy port")
-        print(f"RAILWAY_API_TCP_PROXY=EXISTS target=8080 domain={proxy['domain']} port={proxy['proxyPort']}")
-        env_host = os.environ.get("RAILWAY_TCP_PROXY_DOMAIN", "").strip()
-        env_port = os.environ.get("RAILWAY_TCP_PROXY_PORT", "").strip()
-        if env_host and env_port and (env_host != proxy["domain"] or env_port != str(proxy["proxyPort"])):
-            print(f"RAILWAY_API_TCP_PROXY_ENV_MISMATCH env={env_host}:{env_port} config={proxy['domain']}:{proxy['proxyPort']}")
+        # Do not destructively delete existing proxies during normal startup.
+        # Runtime endpoint variables are authoritative; leave extra resources intact.
         return False
-
+    if len(target) == 1:
+        p = target[0]
+        if not p["domain"] or not 1 <= p["proxyPort"] <= 65535:
+            raise ApiError("Railway TCP proxy targeting 8080 has invalid domain or proxy port")
+        print(f"RAILWAY_API_TCP_PROXY=EXISTS target=8080 domain={p['domain']} port={p['proxyPort']}")
+        if env_host and env_port and (env_host != p["domain"] or env_port != str(p["proxyPort"])):
+            print(f"RAILWAY_API_TCP_PROXY_ENV_MISMATCH env={env_host}:{env_port} config={p['domain']}:{p['proxyPort']}")
+        return False
     print("RAILWAY_API_ACTION=CREATE_TCP_PROXY target=8080")
-    result = gql(
-        """mutation($input:TCPProxyCreateInput!){ tcpProxyCreate(input:$input){id domain proxyPort applicationPort} }""",
-        {"input": {"serviceId": SERVICE_ID, "environmentId": ENVIRONMENT_ID, "applicationPort": TARGET_PORT}},
-    )
-    proxy = result.get("tcpProxyCreate") or {}
-    if not proxy.get("domain") or not proxy.get("proxyPort"):
+    result = gql("mutation($input:TCPProxyCreateInput!){ tcpProxyCreate(input:$input){id domain proxyPort applicationPort} }", {"input": {"serviceId": SERVICE_ID, "environmentId": ENVIRONMENT_ID, "applicationPort": TARGET_PORT}})
+    p = result.get("tcpProxyCreate") or {}
+    if not p.get("domain") or not p.get("proxyPort"):
         raise ApiError("tcpProxyCreate returned incomplete proxy information")
-    print(f"RAILWAY_API_TCP_PROXY=CREATED domain={proxy.get('domain','')} port={proxy.get('proxyPort','')} target=8080")
+    print(f"RAILWAY_API_TCP_PROXY=CREATED domain={p['domain']} port={p['proxyPort']} target=8080")
     return True
 
 
@@ -296,45 +216,23 @@ def setup():
         return 0
     resolve_ids()
     print("RAILWAY_API_SETUP=CHECK")
-    service_domains = list_service_domains()
+    domains = list_service_domains()
     current_domain = os.environ.get("RAILWAY_PUBLIC_DOMAIN", "").strip()
     changed = False
-    patch_deploy_happened = False
-
-    if not service_domains:
+    if not domains:
         create_service_domain()
         changed = True
-    elif len(service_domains) == 1:
-        configured = service_domains[0]["domain"]
-        print(f"RAILWAY_API_PUBLIC_DOMAIN=EXISTS domain={configured}")
-        if current_domain and current_domain != configured:
-            print(f"RAILWAY_API_PUBLIC_DOMAIN_ENV_MISMATCH env={current_domain} config={configured}")
+    elif len(domains) == 1:
+        print(f"RAILWAY_API_PUBLIC_DOMAIN=EXISTS domain={domains[0]['domain']}")
     else:
-        keep = next((d for d in service_domains if d["domain"] == current_domain), service_domains[0])
-        print(f"RAILWAY_API_PUBLIC_DOMAIN=DUPLICATES count={len(service_domains)} keep={keep['domain']}")
-        for domain in service_domains:
-            if domain is keep:
-                continue
-            delete_service_domain(domain["id"], domain["domain"], domain.get("config_key", ""))
-            changed = True
-            if not domain["id"]:
-                patch_deploy_happened = True
-        print(f"RAILWAY_API_PUBLIC_DOMAIN=RECONCILED count=1 keep={keep['domain']}")
-
+        keep = next((d for d in domains if d["domain"] == current_domain), domains[0])
+        print(f"RAILWAY_API_PUBLIC_DOMAIN=DUPLICATES count={len(domains)} keep={keep['domain']}")
+        # Non-destructive: never delete a live domain merely because another exists.
     if ensure_tcp_proxy():
         changed = True
-
-    if changed and not patch_deploy_happened:
-        print("RAILWAY_API_ACTION=REDEPLOY")
-        gql(
-            """mutation($serviceId:String!,$environmentId:String!){
-                 serviceInstanceRedeploy(serviceId:$serviceId,environmentId:$environmentId)
-               }""",
-            {"serviceId": SERVICE_ID, "environmentId": ENVIRONMENT_ID},
-        )
-        print("RAILWAY_API_SETUP=REDEPLOY_REQUESTED")
-        return 10
     if changed:
+        print("RAILWAY_API_ACTION=REDEPLOY")
+        gql("mutation($serviceId:String!,$environmentId:String!){ serviceInstanceRedeploy(serviceId:$serviceId,environmentId:$environmentId) }", {"serviceId": SERVICE_ID, "environmentId": ENVIRONMENT_ID})
         print("RAILWAY_API_SETUP=REDEPLOY_REQUESTED")
         return 10
     print("RAILWAY_API_SETUP=READY")
@@ -345,5 +243,13 @@ if __name__ == "__main__":
     try:
         sys.exit(setup())
     except Exception as exc:
+        # Control-plane API is optional when Railway has already injected a
+        # complete runtime endpoint set. This is the critical account-change
+        # safety path: never take a healthy runtime offline solely because the
+        # old/new account token cannot reach the control plane.
+        if runtime_endpoints_complete():
+            print(f"RAILWAY_API_SETUP=DEGRADED reason={exc}", file=sys.stderr)
+            print("RAILWAY_API_SETUP=CONTINUE_RUNTIME_ENDPOINTS", file=sys.stderr)
+            sys.exit(0)
         print(f"RAILWAY_API_SETUP=ERROR {exc}", file=sys.stderr)
         sys.exit(20)

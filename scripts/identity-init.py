@@ -1,16 +1,16 @@
 #!/usr/bin/env python3
 """Initialize and persist node identity on the mounted persistent volume.
 
-Identity is a persistent deployment primitive. A brand-new empty volume may be
-initialized once. Once the marker exists, the complete identity must remain
-present and match its integrity seal; otherwise startup fails closed and no
-identity is regenerated.
-
-The subscription token is immutable during normal operation. An intentional,
-operator-controlled token rotation is allowed only through the
-SUBSCRIPTION_TOKEN_ROTATE_ID environment variable. The rotation ID is a
-one-time request key; repeating the same ID is idempotent and never rotates a
-second time.
+Lifecycle contract:
+  1. /data must be a real mounted Persistent Volume.
+  2. Without the initialization marker, the identity area must be completely
+     clean. Any identity residue is fatal; identity is never mixed/repaired.
+  3. With the marker, every identity file and the integrity seal must be
+     present, valid, and unchanged. Missing/corrupt state is fatal.
+  4. Normal startup always reuses the persisted identity.
+  5. Subscription Token rotation is the only deliberate exception and is
+     allowed only through SUBSCRIPTION_TOKEN_ROTATE_ID after a valid sealed
+     identity already exists.
 """
 import datetime
 import hashlib
@@ -101,7 +101,6 @@ def identity_complete() -> bool:
     public = read_nonempty(PUB_FILE)
     token = read_nonempty(TOKEN_FILE)
     ids_raw = read_nonempty(IDS_FILE)
-
     if not UUID_RE.fullmatch(uuid):
         return False
     if not REALITY_KEY_RE.fullmatch(private):
@@ -128,10 +127,7 @@ def file_sha256(path: Path) -> str:
 
 
 def build_seal() -> dict:
-    return {
-        "schema": 1,
-        "files": {path.name: file_sha256(path) for path in IDENTITY_FILES},
-    }
+    return {"schema": 1, "files": {path.name: file_sha256(path) for path in IDENTITY_FILES}}
 
 
 def write_seal() -> None:
@@ -144,9 +140,7 @@ def seal_valid() -> bool:
         return False
     try:
         obj = json.loads(raw)
-        if obj.get("schema") != 1 or obj.get("files") != build_seal()["files"]:
-            return False
-        return True
+        return obj.get("schema") == 1 and obj.get("files") == build_seal()["files"]
     except Exception:
         return False
 
@@ -155,8 +149,7 @@ def identity_fingerprint() -> str:
     """Return a non-secret stable fingerprint for deployment log verification."""
     uuid = read_nonempty(UUID_FILE)
     public = read_nonempty(PUB_FILE)
-    digest = hashlib.sha256(f"{uuid}\n{public}".encode()).hexdigest()
-    return digest[:16]
+    return hashlib.sha256(f"{uuid}\n{public}".encode()).hexdigest()[:16]
 
 
 def emit_identity_status(state: str) -> None:
@@ -169,10 +162,7 @@ def emit_identity_status(state: str) -> None:
 def validate_rotation_id(value: str) -> str:
     value = value.strip()
     if not ROTATION_ID_RE.fullmatch(value):
-        raise SystemExit(
-            "FATAL: SUBSCRIPTION_TOKEN_ROTATE_ID must match YYYYMMDD-NNN "
-            "with NNN from 001 to 999"
-        )
+        raise SystemExit("FATAL: SUBSCRIPTION_TOKEN_ROTATE_ID must match YYYYMMDD-NNN with NNN from 001 to 999")
     date_part, sequence = value.split("-", 1)
     try:
         datetime.datetime.strptime(date_part, "%Y%m%d")
@@ -185,9 +175,7 @@ def validate_rotation_id(value: str) -> str:
 
 def requested_rotation_id() -> str:
     raw = os.environ.get("SUBSCRIPTION_TOKEN_ROTATE_ID", "").strip()
-    if not raw:
-        return ""
-    return validate_rotation_id(raw)
+    return validate_rotation_id(raw) if raw else ""
 
 
 def read_rotation_state() -> dict | None:
@@ -213,11 +201,7 @@ def write_rotation_state(rotation_id: str) -> None:
     token = read_nonempty(TOKEN_FILE)
     if not token:
         raise SystemExit("FATAL: rotated subscription token is missing")
-    state = {
-        "schema": 1,
-        "last_rotation_id": rotation_id,
-        "token_sha256": hashlib.sha256(token.encode()).hexdigest(),
-    }
+    state = {"schema": 1, "last_rotation_id": rotation_id, "token_sha256": hashlib.sha256(token.encode()).hexdigest()}
     atomic_write(ROTATION_STATE_FILE, json.dumps(state, sort_keys=True, separators=(",", ":")))
 
 
@@ -225,21 +209,14 @@ def rotate_subscription_token_if_requested() -> None:
     rotation_id = requested_rotation_id()
     if not rotation_id:
         return
-
     state = read_rotation_state()
     if state is not None and state["last_rotation_id"] == rotation_id:
         current_token = read_nonempty(TOKEN_FILE)
         current_hash = hashlib.sha256(current_token.encode()).hexdigest() if current_token else ""
         if current_hash != state["token_sha256"]:
-            raise SystemExit(
-                "FATAL: subscription token does not match the recorded rotation state; refusing to rotate"
-            )
+            raise SystemExit("FATAL: subscription token does not match the recorded rotation state; refusing to rotate")
         print(f"SUBSCRIPTION_TOKEN_ROTATION=ALREADY_APPLIED request_id={rotation_id}")
         return
-
-    # Deliberate exception to normal identity immutability: only the
-    # subscription token changes. UUID, REALITY keys and Short IDs are never
-    # regenerated or modified by this operation.
     new_token = secrets.token_urlsafe(32)
     atomic_write(TOKEN_FILE, new_token)
     if not identity_complete():
@@ -255,7 +232,6 @@ def generate_identity() -> None:
     uuid = subprocess.check_output(["xray", "uuid"], text=True).strip()
     if not UUID_RE.fullmatch(uuid):
         raise RuntimeError("xray generated an invalid UUID")
-
     raw = subprocess.check_output(["xray", "x25519"], text=True, stderr=subprocess.STDOUT)
     private = public = ""
     for line in raw.splitlines():
@@ -270,10 +246,8 @@ def generate_identity() -> None:
             public = line.split(":", 1)[1].strip()
     if not REALITY_KEY_RE.fullmatch(private) or not REALITY_KEY_RE.fullmatch(public):
         raise RuntimeError("xray generated an invalid REALITY key pair")
-
     token = secrets.token_urlsafe(32)
     ids = [secrets.token_hex(6) for _ in range(3)]
-
     atomic_write(UUID_FILE, uuid)
     atomic_write(PRIV_FILE, private)
     atomic_write(PUB_FILE, public)
@@ -287,60 +261,44 @@ def write_marker() -> None:
 
 def main() -> None:
     require_persistent_mount()
-
     marked = MARKER.is_file()
-    complete = identity_complete()
     rotation_id = requested_rotation_id()
 
-    if marked:
-        if not complete:
+    if not marked:
+        # Strict first-start contract: no identity residue is permitted.
+        if any(p.exists() for p in IDENTITY_FILES) or SEAL_FILE.exists():
             raise SystemExit(
-                "FATAL: node identity was previously initialized but is missing or invalid; "
-                "refusing to rotate identity"
+                "FATAL: partial or residual node identity found on an uninitialized volume; "
+                "refusing to mix, repair, or replace identity"
             )
-        if SEAL_FILE.exists():
-            if not seal_valid():
-                raise SystemExit(
-                    "FATAL: node identity integrity seal mismatch; refusing to rotate identity"
-                )
-            rotate_subscription_token_if_requested()
-            emit_identity_status("REUSED")
-            return
-        # One-time seal migration for the identity created by the previous
-        # identity-init revision. No identity value is changed or regenerated.
+        if ROTATION_STATE_FILE.exists():
+            raise SystemExit("FATAL: subscription token rotation state exists without initialized node identity")
         if rotation_id:
             raise SystemExit(
-                "FATAL: subscription token rotation requires an existing integrity seal; "
-                "remove SUBSCRIPTION_TOKEN_ROTATE_ID and allow the one-time seal migration first"
+                "FATAL: SUBSCRIPTION_TOKEN_ROTATE_ID is only valid after the persistent identity "
+                "has been initialized and sealed"
             )
+        generate_identity()
+        if not identity_complete():
+            raise SystemExit("FATAL: node identity initialization did not produce a complete identity set")
         write_seal()
-        emit_identity_status("REUSED")
-        return
-
-    if rotation_id:
-        raise SystemExit(
-            "FATAL: SUBSCRIPTION_TOKEN_ROTATE_ID is only valid after the persistent identity "
-            "has been initialized and sealed"
-        )
-
-    if complete:
-        write_seal()
+        if not seal_valid():
+            raise SystemExit("FATAL: node identity initialization produced an invalid integrity seal")
         write_marker()
-        emit_identity_status("REUSED_INITIALIZED")
+        emit_identity_status("INITIALIZED")
         return
 
-    if any(p.exists() for p in IDENTITY_FILES) or SEAL_FILE.exists():
-        raise SystemExit(
-            "FATAL: partial or invalid node identity found on an uninitialized volume; "
-            "refusing to mix, repair, or replace identity"
-        )
-
-    generate_identity()
+    # Once the marker exists, all identity files AND the integrity seal are mandatory.
+    # Never silently migrate, repair, or regenerate identity on a marked volume.
     if not identity_complete():
-        raise SystemExit("FATAL: node identity initialization did not produce a complete identity set")
-    write_seal()
-    write_marker()
-    emit_identity_status("INITIALIZED")
+        raise SystemExit(
+            "FATAL: node identity was previously initialized but is missing or invalid; refusing to regenerate identity"
+        )
+    if not SEAL_FILE.is_file() or not seal_valid():
+        raise SystemExit("FATAL: node identity integrity seal is missing or mismatched; refusing to regenerate identity")
+
+    rotate_subscription_token_if_requested()
+    emit_identity_status("REUSED")
 
 
 if __name__ == "__main__":

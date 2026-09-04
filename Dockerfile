@@ -27,13 +27,19 @@ RUN set -eu; \
     check xray_digest_pinned sh -c 'test "${XRAY_IMAGE_DIGEST}" = "sha256:592ec4d11f656db95598d01e76dbcc6e002d67360b96a5436500a938230f52c7"'; \
     check py_compile python3 -m py_compile /opt/xray/scripts/*.py; \
     check identity_init_present test -f /opt/xray/scripts/identity-init.py; \
+    check subscription_contract_present test -f /opt/xray/scripts/subscription-contract.py; \
     check persistent_volume_guard grep -q 'not a mounted persistent volume' /opt/xray/scripts/identity-init.py; \
     check identity_reuse grep -q 'emit_identity_status("REUSED")' /opt/xray/scripts/identity-init.py; \
     check identity_fail_closed grep -q 'refusing to rotate identity' /opt/xray/scripts/identity-init.py; \
     check identity_integrity_seal grep -q 'identity-integrity.json' /opt/xray/scripts/identity-init.py; \
+    check subscription_token_sealed grep -q 'TOKEN_SEAL_MISMATCH' /opt/xray/scripts/subscription-contract.py; \
+    check subscription_http_contract grep -q 'SUBSCRIPTION_HTTP_LOCAL=PASS' /opt/xray/scripts/subscription-contract.py; \
+    check subscription_endpoint_contract grep -q 'SUBSCRIPTION_ENDPOINT_CONTRACT=PASS' /opt/xray/scripts/subscription-contract.py; \
+    check subscription_no_secret_logs grep -q 'SUBSCRIPTION_SECRETS_EXPOSED=NO' /opt/xray/scripts/subscription-contract.py; \
     check boot_identity_init grep -q 'identity-init.py' /opt/xray/scripts/boot.sh; \
     check identity_policy grep -q 'NODE_IDENTITY_POLICY=INITIALIZE_ONCE_REUSE_FOREVER' /opt/xray/scripts/boot.sh; \
     check short_ids_immutable grep -q 'Short IDs are part of node identity' /opt/xray/scripts/generate.py; \
+    check subscription_contract_invoked grep -q 'subscription-contract.py' /opt/xray/scripts/generate.py; \
     check gateway_early grep -q 'GATEWAY_BIND_EARLY=PASS' /opt/xray/scripts/boot.sh; \
     check deployment_summary grep -q 'DEPLOYMENT SUMMARY' /opt/xray/scripts/boot.sh; \
     check gateway_json grep -q 'application/json' /opt/xray/scripts/gateway.py; \
@@ -54,7 +60,7 @@ RUN set -eu; \
     chmod 0755 /usr/local/bin/xray /usr/local/bin/cloudflared /opt/xray/scripts/*.sh /opt/xray/scripts/*.py; \
     chmod 0644 /opt/xray/config/* /opt/xray/site/*
 
-RUN echo "SOURCE_BUILD=runtime-derived BUILD_ID=runtime-derived NODE6=VLESS_XHTTP_TLS_CLOUDFLARE NODE_IDENTITY=INITIALIZE_ONCE_REUSE_FOREVER XRAY=26.3.27 XRAY_PINNED=true"
+RUN echo "SOURCE_BUILD=runtime-derived BUILD_ID=runtime-derived NODE6=VLESS_XHTTP_TLS_CLOUDFLARE NODE_IDENTITY=INITIALIZE_ONCE_REUSE_FOREVER XRAY=26.3.27 XRAY_PINNED=true SUBSCRIPTION_CONTRACT=ENFORCED"
 EXPOSE 8080
 RUN test -x /opt/xray/scripts/railway_setup.py && python3 -m py_compile /opt/xray/scripts/railway_setup.py
 HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 CMD python3 -c "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8080/health', timeout=3).read()"

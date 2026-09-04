@@ -21,7 +21,6 @@ API_RETRY_DELAY = max(1.0, float(os.environ.get("RAILWAY_API_RETRY_DELAY", "2.5"
 
 PROJECT_TOKEN = os.environ.get("RAILWAY_TOKEN", "").strip()
 ACCOUNT_TOKEN = os.environ.get("RAILWAY_API_TOKEN", "").strip()
-TOKEN = PROJECT_TOKEN or ACCOUNT_TOKEN
 PROJECT_ID = os.environ.get("RAILWAY_PROJECT_ID", "").strip()
 ENVIRONMENT_ID = os.environ.get("RAILWAY_ENVIRONMENT_ID", "").strip()
 SERVICE_ID = os.environ.get("RAILWAY_SERVICE_ID", "").strip()
@@ -32,10 +31,10 @@ class ApiError(RuntimeError):
     pass
 
 
-def _request_once(query, variables, mode):
+def _request_once(query, variables, mode, token):
     headers = {"Content-Type": "application/json", "User-Agent": "railway-universal-stable/5.6"}
     headers["Project-Access-Token" if mode == "project" else "Authorization"] = (
-        TOKEN if mode == "project" else f"Bearer {TOKEN}"
+        token if mode == "project" else f"Bearer {token}"
     )
     req = urllib.request.Request(
         API_URL,
@@ -63,11 +62,11 @@ def _request_once(query, variables, mode):
     return body.get("data") or {}
 
 
-def _request(query, variables, mode):
+def _request(query, variables, mode, token):
     last = None
     for attempt in range(1, API_RETRIES + 1):
         try:
-            return _request_once(query, variables, mode)
+            return _request_once(query, variables or {}, mode, token)
         except ApiError as exc:
             last = exc
             if not getattr(exc, "retryable", False) or attempt >= API_RETRIES:
@@ -79,32 +78,41 @@ def _request(query, variables, mode):
 
 def gql(query, variables=None):
     global AUTH_MODE
-    if not TOKEN:
-        raise ApiError("no Railway token")
+    variables = variables or {}
     if AUTH_MODE:
-        return _request(query, variables or {}, AUTH_MODE)
+        token = PROJECT_TOKEN if AUTH_MODE == "project" else ACCOUNT_TOKEN
+        if not token:
+            raise ApiError(f"configured Railway auth mode {AUTH_MODE} has no token")
+        return _request(query, variables, AUTH_MODE, token)
+
+    errors = []
     if PROJECT_TOKEN:
         try:
-            data = _request(query, variables or {}, "project")
+            data = _request(query, variables, "project", PROJECT_TOKEN)
             AUTH_MODE = "project"
             return data
-        except ApiError as project_error:
-            try:
-                data = _request(query, variables or {}, "bearer")
-                AUTH_MODE = "bearer"
-                print("RAILWAY_API_AUTH=BEARER_FALLBACK")
-                return data
-            except ApiError:
-                raise project_error
-    AUTH_MODE = "bearer"
-    return _request(query, variables or {}, "bearer")
+        except ApiError as exc:
+            errors.append(exc)
+
+    if ACCOUNT_TOKEN and ACCOUNT_TOKEN != PROJECT_TOKEN:
+        try:
+            data = _request(query, variables, "bearer", ACCOUNT_TOKEN)
+            AUTH_MODE = "bearer"
+            print("RAILWAY_API_AUTH=BEARER_FALLBACK")
+            return data
+        except ApiError as exc:
+            errors.append(exc)
+
+    if errors:
+        raise errors[-1]
+    raise ApiError("no Railway token")
 
 
 def resolve_ids():
     global PROJECT_ID, ENVIRONMENT_ID, SERVICE_ID
     if not PROJECT_ID or not ENVIRONMENT_ID:
         if not PROJECT_TOKEN:
-            raise ApiError("Railway project/environment IDs are unavailable")
+            raise ApiError("Railway project/environment IDs are unavailable; set RAILWAY_PROJECT_ID and RAILWAY_ENVIRONMENT_ID when using account-token fallback")
         data = gql("query { projectToken { projectId environmentId } }")
         info = data.get("projectToken") or {}
         PROJECT_ID = PROJECT_ID or str(info.get("projectId", ""))
@@ -128,7 +136,6 @@ def resolve_ids():
 
 
 def _normalize_domain_entries(raw):
-    """Normalize Railway environment-config serviceDomains without assuming a schema field."""
     result = []
     if isinstance(raw, dict):
         for key, value in raw.items():
@@ -155,7 +162,6 @@ def _normalize_domain_entries(raw):
 
 
 def list_service_domains():
-    """Read Railway-provided domains from the environment configuration."""
     data = gql(
         """query($id:String!){ environment(id:$id){ config(decryptVariables:false) } }""",
         {"id": ENVIRONMENT_ID},
@@ -285,7 +291,7 @@ def ensure_tcp_proxy():
 
 
 def setup():
-    if not TOKEN:
+    if not PROJECT_TOKEN and not ACCOUNT_TOKEN:
         print("RAILWAY_API_SETUP=SKIP reason=no_token")
         return 0
     resolve_ids()

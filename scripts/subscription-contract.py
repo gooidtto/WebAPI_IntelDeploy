@@ -5,7 +5,7 @@ The token is an identity primitive on the persistent volume. Railway endpoints
 are runtime state and may change between deployments. This contract verifies
 that the token remains sealed to the persistent identity while the served
 subscription exactly follows the current deployment endpoints, without printing
-any UUID, key, or short ID.
+any UUID, key, short ID, or token.
 """
 import base64
 import hashlib
@@ -13,6 +13,7 @@ import json
 import os
 import re
 import sys
+import time
 import urllib.error
 import urllib.request
 from pathlib import Path
@@ -22,6 +23,12 @@ TOKEN_FILE = D / "subscription_token.txt"
 SEAL_FILE = D / "identity-integrity.json"
 SUB_FILE = D / "subscription.txt"
 RUNTIME_FILE = D / "runtime.json"
+
+# Gateway startup and HTTP route readiness are not atomic. Keep the contract
+# fail-closed, but allow a short bounded readiness window before failing.
+HTTP_ATTEMPTS = max(1, int(os.environ.get("SUBSCRIPTION_HTTP_ATTEMPTS", "15")))
+HTTP_TIMEOUT = max(1.0, float(os.environ.get("SUBSCRIPTION_HTTP_TIMEOUT", "3")))
+HTTP_RETRY_DELAY = max(0.1, float(os.environ.get("SUBSCRIPTION_HTTP_RETRY_DELAY", "0.5")))
 
 
 def fail(reason: str) -> None:
@@ -94,6 +101,66 @@ def validate_lines(lines, runtime):
     return expected, public, tcp_host, tcp_port
 
 
+def local_subscription_request(url: str):
+    """Fetch /sub with bounded readiness retries and safe diagnostics."""
+    last_status = None
+    last_error = None
+
+    for attempt in range(1, HTTP_ATTEMPTS + 1):
+        try:
+            request = urllib.request.Request(
+                url,
+                method="GET",
+                headers={"Cache-Control": "no-cache"},
+            )
+            with urllib.request.urlopen(request, timeout=HTTP_TIMEOUT) as response:
+                status = int(response.status)
+                if status != 200:
+                    last_status = status
+                    if status in (404, 408, 425, 429) or status >= 500:
+                        if attempt < HTTP_ATTEMPTS:
+                            print(
+                                f"SUBSCRIPTION_HTTP_LOCAL=RETRY attempt={attempt}/{HTTP_ATTEMPTS} status={status}",
+                                file=sys.stderr,
+                            )
+                            time.sleep(HTTP_RETRY_DELAY)
+                            continue
+                    fail(f"HTTP_STATUS_{status}")
+                return response.read()
+
+        except urllib.error.HTTPError as exc:
+            status = int(exc.code)
+            last_status = status
+            # The gateway can expose 404 briefly while its HTTP route is
+            # starting. Retry 404/408/425/429 and all 5xx responses only within
+            # the bounded startup window. Permanent 401/403-style failures are
+            # not retried and fail closed immediately.
+            retryable = status in (404, 408, 425, 429) or status >= 500
+            if retryable and attempt < HTTP_ATTEMPTS:
+                print(
+                    f"SUBSCRIPTION_HTTP_LOCAL=RETRY attempt={attempt}/{HTTP_ATTEMPTS} status={status}",
+                    file=sys.stderr,
+                )
+                time.sleep(HTTP_RETRY_DELAY)
+                continue
+            fail(f"HTTP_STATUS_{status}")
+
+        except (urllib.error.URLError, TimeoutError, OSError) as exc:
+            last_error = type(exc).__name__
+            if attempt < HTTP_ATTEMPTS:
+                print(
+                    f"SUBSCRIPTION_HTTP_LOCAL=RETRY attempt={attempt}/{HTTP_ATTEMPTS} error={last_error}",
+                    file=sys.stderr,
+                )
+                time.sleep(HTTP_RETRY_DELAY)
+                continue
+            fail(f"HTTP_LOCAL_ACCESS_{last_error}")
+
+    if last_status is not None:
+        fail(f"HTTP_STATUS_{last_status}")
+    fail(f"HTTP_LOCAL_ACCESS_{last_error or 'UNKNOWN'}")
+
+
 def main():
     token = read(TOKEN_FILE)
     if not (20 <= len(token) <= 256) or not re.fullmatch(r"[A-Za-z0-9_-]+", token):
@@ -117,19 +184,15 @@ def main():
         "tcp_proxy": f"{tcp_host}:{tcp_port}",
         "cloudflare": bool((runtime.get("cloudflare") or {}).get("enabled")),
     }
-    version = hashlib.sha256(json.dumps(contract_material, sort_keys=True, separators=(",", ":")).encode()).hexdigest()[:16]
+    version = hashlib.sha256(
+        json.dumps(contract_material, sort_keys=True, separators=(",", ":")).encode()
+    ).hexdigest()[:16]
     epfp = endpoint_fingerprint(public, tcp_host, tcp_port, expected)
 
     # Verify the gateway's subscription URL locally. The token itself is never logged.
     gateway_port = int(os.environ.get("GATEWAY_PORT", "8080"))
     url = f"http://127.0.0.1:{gateway_port}/sub/{token}"
-    try:
-        with urllib.request.urlopen(url, timeout=5) as response:
-            if response.status != 200:
-                fail(f"HTTP_STATUS_{response.status}")
-            raw = response.read()
-    except (urllib.error.URLError, TimeoutError, OSError) as exc:
-        fail(f"HTTP_LOCAL_ACCESS_{type(exc).__name__}")
+    raw = local_subscription_request(url)
 
     try:
         decoded = base64.b64decode(raw, validate=True).decode()

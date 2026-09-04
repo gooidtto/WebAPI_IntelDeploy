@@ -38,16 +38,19 @@ RUN set -eu; \
     check subscription_no_secret_logs grep -q 'SUBSCRIPTION_SECRETS_EXPOSED=NO' /opt/xray/scripts/subscription-contract.py; \
     check boot_identity_init grep -q 'identity-init.py' /opt/xray/scripts/boot.sh; \
     check identity_policy grep -q 'NODE_IDENTITY_POLICY=INITIALIZE_ONCE_REUSE_FOREVER' /opt/xray/scripts/boot.sh; \
-    check short_ids_immutable grep -q 'Short IDs are part of node identity' /opt/xray/scripts/generate.py; \
+    check short_ids_immutable grep -q 'reality_short_ids.json' /opt/xray/scripts/generate.py; \
+    check subscription_url_generate grep -q 'subscription_url.txt' /opt/xray/scripts/generate.py; \
+    check subscription_url_boot_guard grep -q 'SUBSCRIPTION_URL_FILE="\$D/subscription_url.txt"' /opt/xray/scripts/boot.sh; \
+    check subscription_url_expected_guard grep -q 'EXPECTED_SUBSCRIPTION_URL=' /opt/xray/scripts/boot.sh; \
     check subscription_contract_invoked grep -q 'subscription-contract.py' /opt/xray/scripts/generate.py; \
     check gateway_early grep -q 'GATEWAY_BIND_EARLY=PASS' /opt/xray/scripts/boot.sh; \
     check deployment_summary grep -q 'DEPLOYMENT SUMMARY' /opt/xray/scripts/boot.sh; \
     check gateway_json grep -q 'application/json' /opt/xray/scripts/gateway.py; \
     check cloudflared_ready grep -q 'CLOUDFLARED_READY=PASS' /opt/xray/scripts/boot.sh; \
     check cloudflare_generator grep -q 'vless-xhttp-cloudflare' /opt/xray/scripts/generate.py; \
-    check xhttp_network grep -q 'type":"xhttp"' /opt/xray/scripts/generate.py; \
+    check xhttp_network grep -q 'type\":\"xhttp\"' /opt/xray/scripts/generate.py; \
     check cloudflare_xhttp_tls grep -q 'cloudflare-xhttp-tls' /opt/xray/scripts/generate.py; \
-    check tcp_proxy_target grep -q 'tcp_proxy_expected_target":8080' /opt/xray/scripts/runtime-manifest.py; \
+    check tcp_proxy_target grep -q 'tcp_proxy_expected_target\":8080' /opt/xray/scripts/runtime-manifest.py; \
     check networking_domain_count grep -q 'RAILWAY_API_PUBLIC_DOMAIN_CONFIG_COUNT=' /opt/xray/scripts/railway_setup.py; \
     check networking_domain_reconcile grep -q 'RAILWAY_API_PUBLIC_DOMAIN=RECONCILED count=1' /opt/xray/scripts/railway_setup.py; \
     check networking_tcp_count grep -q 'RAILWAY_API_TCP_PROXY_CONFIG_COUNT=' /opt/xray/scripts/railway_setup.py; \

@@ -12,8 +12,6 @@ export DATA_DIR="$D"
 python3 /opt/xray/scripts/identity-init.py
 echo "NODE_IDENTITY_POLICY=INITIALIZE_ONCE_REUSE_FOREVER"
 
-# Bind the gateway before Railway networking/Xray readiness. Keep its durable
-# log on the volume, and mirror it to the deployment log stream for diagnostics.
 python3 /opt/xray/scripts/gateway.py >"$D/gateway.log" 2>&1 & GP=$!
 tail -n 0 -F "$D/gateway.log" 2>/dev/null & GLP=$!
 
@@ -35,7 +33,6 @@ fi
 PUBLIC_DOMAIN="${RAILWAY_PUBLIC_DOMAIN:-}"
 TCP_HOST="${RAILWAY_TCP_PROXY_DOMAIN:-}"
 TCP_PORT="${RAILWAY_TCP_PROXY_PORT:-}"
-
 NETWORK_DISCOVERY_TIMEOUT="${RAILWAY_NETWORK_DISCOVERY_TIMEOUT:-180}"
 NETWORK_DISCOVERY_INTERVAL="${RAILWAY_NETWORK_DISCOVERY_INTERVAL:-3}"
 NETWORK_DISCOVERY_ELAPSED=0
@@ -56,7 +53,6 @@ echo "RAILWAY_NETWORK_DISCOVERY=READY elapsed=${NETWORK_DISCOVERY_ELAPSED}s"
 case "$TCP_PORT" in ''|*[!0-9]*) echo "FATAL: RAILWAY_TCP_PROXY_PORT must be numeric" >&2; exit 1;; esac
 [ "$TCP_PORT" -ge 1 ] && [ "$TCP_PORT" -le 65535 ] || { echo "FATAL: Railway TCP Proxy port out of range" >&2; exit 1; }
 
-# Endpoints are runtime state. Never restore them from /data.
 for f in "$D/runtime.json" "$D/state.json" "$D/manifest.json" "$D/runtime-manifest.json" "$D/subscription.txt" "$D/subscription.txt.tmp" "$D/subscription_url.txt" "${XRAY_CONFIG:-$D/config.json}"; do
   rm -f "$f"
 done
@@ -110,6 +106,19 @@ if [ "$TCP_PROXY_CONNECTIVITY" != "READY" ]; then TCP_PROXY_CONNECTIVITY=UNCONFI
 if [ "$TCP_PROXY_CONNECTIVITY" = "READY" ] && [ "$TCP_PROXY_SETTLE_SECONDS" -gt 0 ]; then echo "TCP_PROXY_SETTLE=WAIT seconds=${TCP_PROXY_SETTLE_SECONDS}"; sleep "$TCP_PROXY_SETTLE_SECONDS"; echo "TCP_PROXY_SETTLE=COMPLETE"; fi
 echo "TCP_PROXY_DOMAIN=${TCP_HOST}"; echo "TCP_PROXY_PORT=${TCP_PORT}"; echo "TCP_PROXY_TARGET_PORT=8080"; echo "TCP_PROXY_DNS=${TCP_PROXY_DNS}"; echo "TCP_PROXY_CONNECTIVITY=${TCP_PROXY_CONNECTIVITY}"; echo "TCP_PROXY_PROBE_SECONDS=${TCP_PROXY_PROBE_ELAPSED}"; echo "TCP_PROXY_SELF_CONNECTIVITY=${TCP_PROXY_CONNECTIVITY}"; echo "TCP_PROXY_EXTERNAL_PATH=UNVERIFIED"; echo "NETWORKING_STATE=READY"
 python3 /opt/xray/scripts/runtime-manifest.py; python3 /opt/xray/scripts/generate.py
+
+# Hard guarantee: the subscription URL is rebuilt from the persisted token and
+# the current Railway public domain on every successful startup. It is runtime
+# state, never an identity source, and is therefore safe to regenerate.
+SUBSCRIPTION_URL_FILE="$D/subscription_url.txt"
+EXPECTED_SUBSCRIPTION_URL="https://${PUBLIC_DOMAIN}/sub/${TOKEN}"
+printf '%s\n' "$EXPECTED_SUBSCRIPTION_URL" >"$SUBSCRIPTION_URL_FILE.tmp"
+chmod 0600 "$SUBSCRIPTION_URL_FILE.tmp"
+mv -f "$SUBSCRIPTION_URL_FILE.tmp" "$SUBSCRIPTION_URL_FILE"
+[ -s "$SUBSCRIPTION_URL_FILE" ] || { echo "FATAL: subscription_url.txt was not created" >&2; exit 1; }
+[ "$(cat "$SUBSCRIPTION_URL_FILE")" = "$EXPECTED_SUBSCRIPTION_URL" ] || { echo "FATAL: subscription_url.txt content mismatch" >&2; exit 1; }
+echo "SUBSCRIPTION_URL_FILE=PASS"
+
 RUNTIME="$D/runtime.json"; [ -s "$RUNTIME" ] || { echo "FATAL: runtime state was not generated" >&2; exit 1; }; echo "RAILWAY_CURRENT_PUBLIC=$PUBLIC_DOMAIN"; echo "RAILWAY_CURRENT_TCP=$TCP_HOST:$TCP_PORT"; echo "RAILWAY_TCP_PROXY_TARGET_PORT=8080"
 python3 - "$RUNTIME" "$D/subscription.txt" <<'PY'
 import json,sys

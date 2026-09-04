@@ -43,6 +43,10 @@ RUN set -eu; \
     check subscription_url_boot_guard grep -q 'SUBSCRIPTION_URL_FILE="\$D/subscription_url.txt"' /opt/xray/scripts/boot.sh; \
     check subscription_url_expected_guard grep -q 'EXPECTED_SUBSCRIPTION_URL=' /opt/xray/scripts/boot.sh; \
     check subscription_contract_invoked grep -q 'subscription-contract.py' /opt/xray/scripts/generate.py; \
+    check token_rotation_id grep -q 'SUBSCRIPTION_TOKEN_ROTATE_ID' /opt/xray/scripts/identity-init.py; \
+    check token_rotation_strict_format grep -q 'ROTATION_ID_RE' /opt/xray/scripts/identity-init.py; \
+    check token_rotation_state grep -q 'subscription-token-rotation.json' /opt/xray/scripts/identity-init.py; \
+    check token_rotation_idempotent grep -q 'ALREADY_APPLIED' /opt/xray/scripts/identity-init.py; \
     check gateway_early grep -q 'GATEWAY_BIND_EARLY=PASS' /opt/xray/scripts/boot.sh; \
     check deployment_summary grep -q 'DEPLOYMENT SUMMARY' /opt/xray/scripts/boot.sh; \
     check gateway_json grep -q 'application/json' /opt/xray/scripts/gateway.py; \

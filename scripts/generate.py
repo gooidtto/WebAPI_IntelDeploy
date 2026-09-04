@@ -3,6 +3,7 @@ import hashlib
 import json
 import os
 import re
+import subprocess
 import urllib.parse
 from pathlib import Path
 
@@ -102,3 +103,7 @@ runtime["fingerprint"] = hashlib.sha256(json.dumps(runtime, sort_keys=True, sepa
 (D/"runtime.json").write_text(json.dumps(runtime, indent=2)+"\n"); (D/"state.json").write_text(json.dumps(runtime, indent=2)+"\n"); (D/"subscription.txt.tmp").write_text("\n".join(lines)+"\n"); os.replace(D/"subscription.txt.tmp", D/"subscription.txt")
 (D/"manifest.json").write_text(json.dumps({"schema":26,"build":BUILD_ID,"node_count":NODE_COUNT,"application_port":APP_PORT,"cloudflare_xhttp_enabled":CF_ENABLED,"distribution":runtime["nodes"]["distribution"],"runtime_fingerprint":runtime["fingerprint"],"railway_networking_source":"current-deployment-environment","railway_networking_authoritative":True,"railway_networking_state":state}, indent=2)+"\n")
 print(f"RELEASE={BUILD_ID}",flush=True); print(f"RUNTIME_FINGERPRINT={runtime['fingerprint']}",flush=True); print("RAILWAY_NETWORKING_SOURCE=current-deployment-environment",flush=True); print("RAILWAY_NETWORKING_AUTHORITATIVE=true",flush=True); print(f"RAILWAY_NETWORKING={state}",flush=True); print(f"RAILWAY_CURRENT_PUBLIC={PUBLIC_DOMAIN}",flush=True); print(f"RAILWAY_CURRENT_TCP={current_tcp}",flush=True); print(f"CLOUDFLARE_XHTTP={'enabled' if CF_ENABLED else 'disabled'}",flush=True); print(f"SUBSCRIPTION_INVARIANT={NODE_COUNT}",flush=True); print("NODE_ORDER=1:domain-xhttp-tls,2:domain-ws-tls,3:raw-reality-vision,4:xhttp-reality,5:grpc-reality,6:cloudflare-xhttp-tls",flush=True); print(f"NODES={NODE_COUNT}",flush=True)
+
+# Final startup gate: verify token permanence, current Railway endpoint binding,
+# and the actual /sub/<token> HTTP rendering before Xray is declared ready.
+subprocess.run(["python3", str(Path(__file__).with_name("subscription-contract.py"))], check=True)

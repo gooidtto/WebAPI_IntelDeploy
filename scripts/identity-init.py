@@ -1,11 +1,18 @@
 #!/usr/bin/env python3
-"""Initialize node identity exactly once on the mounted persistent volume.
+"""Initialize and persist node identity on the mounted persistent volume.
 
-Identity is a persistent, immutable deployment primitive. A brand-new empty
-volume may be initialized once. Once the marker exists, the complete identity
-must remain present and match its integrity seal; otherwise startup fails closed
-and no identity is regenerated.
+Identity is a persistent deployment primitive. A brand-new empty volume may be
+initialized once. Once the marker exists, the complete identity must remain
+present and match its integrity seal; otherwise startup fails closed and no
+identity is regenerated.
+
+The subscription token is immutable during normal operation. An intentional,
+operator-controlled token rotation is allowed only through the
+SUBSCRIPTION_TOKEN_ROTATE_ID environment variable. The rotation ID is a
+one-time request key; repeating the same ID is idempotent and never rotates a
+second time.
 """
+import datetime
 import hashlib
 import json
 import os
@@ -23,11 +30,13 @@ TOKEN_FILE = D / "subscription_token.txt"
 IDS_FILE = D / "reality_short_ids.json"
 SEAL_FILE = D / "identity-integrity.json"
 MARKER = D / ".node-identity-initialized"
+ROTATION_STATE_FILE = D / "subscription-token-rotation.json"
 
 IDENTITY_FILES = (UUID_FILE, PRIV_FILE, PUB_FILE, TOKEN_FILE, IDS_FILE)
 UUID_RE = re.compile(r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-5][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}$")
 REALITY_KEY_RE = re.compile(r"^[A-Za-z0-9_-]{32,64}$")
 SHORT_ID_RE = re.compile(r"^[0-9a-fA-F]{2,32}$")
+ROTATION_ID_RE = re.compile(r"^[0-9]{8}-[0-9]{3}$")
 
 
 def persistent_mount_present(path: Path) -> bool:
@@ -157,6 +166,91 @@ def emit_identity_status(state: str) -> None:
     print(f"NODE_IDENTITY_FINGERPRINT={identity_fingerprint()}")
 
 
+def validate_rotation_id(value: str) -> str:
+    value = value.strip()
+    if not ROTATION_ID_RE.fullmatch(value):
+        raise SystemExit(
+            "FATAL: SUBSCRIPTION_TOKEN_ROTATE_ID must match YYYYMMDD-NNN "
+            "with NNN from 001 to 999"
+        )
+    date_part, sequence = value.split("-", 1)
+    try:
+        datetime.datetime.strptime(date_part, "%Y%m%d")
+    except ValueError:
+        raise SystemExit("FATAL: SUBSCRIPTION_TOKEN_ROTATE_ID contains an invalid Gregorian date")
+    if not 1 <= int(sequence) <= 999:
+        raise SystemExit("FATAL: SUBSCRIPTION_TOKEN_ROTATE_ID sequence must be 001-999")
+    return value
+
+
+def requested_rotation_id() -> str:
+    raw = os.environ.get("SUBSCRIPTION_TOKEN_ROTATE_ID", "").strip()
+    if not raw:
+        return ""
+    return validate_rotation_id(raw)
+
+
+def read_rotation_state() -> dict | None:
+    raw = read_nonempty(ROTATION_STATE_FILE)
+    if not raw:
+        return None
+    try:
+        obj = json.loads(raw)
+    except Exception:
+        raise SystemExit("FATAL: subscription token rotation state is corrupt; refusing to rotate")
+    if not isinstance(obj, dict) or obj.get("schema") != 1:
+        raise SystemExit("FATAL: subscription token rotation state is invalid; refusing to rotate")
+    last_id = obj.get("last_rotation_id")
+    token_sha256 = obj.get("token_sha256")
+    if not isinstance(last_id, str) or not ROTATION_ID_RE.fullmatch(last_id):
+        raise SystemExit("FATAL: subscription token rotation state has an invalid rotation ID")
+    if not isinstance(token_sha256, str) or not re.fullmatch(r"[0-9a-f]{64}", token_sha256):
+        raise SystemExit("FATAL: subscription token rotation state has an invalid token digest")
+    return obj
+
+
+def write_rotation_state(rotation_id: str) -> None:
+    token = read_nonempty(TOKEN_FILE)
+    if not token:
+        raise SystemExit("FATAL: rotated subscription token is missing")
+    state = {
+        "schema": 1,
+        "last_rotation_id": rotation_id,
+        "token_sha256": hashlib.sha256(token.encode()).hexdigest(),
+    }
+    atomic_write(ROTATION_STATE_FILE, json.dumps(state, sort_keys=True, separators=(",", ":")))
+
+
+def rotate_subscription_token_if_requested() -> None:
+    rotation_id = requested_rotation_id()
+    if not rotation_id:
+        return
+
+    state = read_rotation_state()
+    if state is not None and state["last_rotation_id"] == rotation_id:
+        current_token = read_nonempty(TOKEN_FILE)
+        current_hash = hashlib.sha256(current_token.encode()).hexdigest() if current_token else ""
+        if current_hash != state["token_sha256"]:
+            raise SystemExit(
+                "FATAL: subscription token does not match the recorded rotation state; refusing to rotate"
+            )
+        print(f"SUBSCRIPTION_TOKEN_ROTATION=ALREADY_APPLIED request_id={rotation_id}")
+        return
+
+    # Deliberate exception to normal identity immutability: only the
+    # subscription token changes. UUID, REALITY keys and Short IDs are never
+    # regenerated or modified by this operation.
+    new_token = secrets.token_urlsafe(32)
+    atomic_write(TOKEN_FILE, new_token)
+    if not identity_complete():
+        raise SystemExit("FATAL: subscription token rotation produced an invalid identity set")
+    write_seal()
+    if not seal_valid():
+        raise SystemExit("FATAL: subscription token rotation produced an invalid integrity seal")
+    write_rotation_state(rotation_id)
+    print(f"SUBSCRIPTION_TOKEN_ROTATION=ROTATED request_id={rotation_id}")
+
+
 def generate_identity() -> None:
     uuid = subprocess.check_output(["xray", "uuid"], text=True).strip()
     if not UUID_RE.fullmatch(uuid):
@@ -196,6 +290,7 @@ def main() -> None:
 
     marked = MARKER.is_file()
     complete = identity_complete()
+    rotation_id = requested_rotation_id()
 
     if marked:
         if not complete:
@@ -208,13 +303,25 @@ def main() -> None:
                 raise SystemExit(
                     "FATAL: node identity integrity seal mismatch; refusing to rotate identity"
                 )
+            rotate_subscription_token_if_requested()
             emit_identity_status("REUSED")
             return
         # One-time seal migration for the identity created by the previous
         # identity-init revision. No identity value is changed or regenerated.
+        if rotation_id:
+            raise SystemExit(
+                "FATAL: subscription token rotation requires an existing integrity seal; "
+                "remove SUBSCRIPTION_TOKEN_ROTATE_ID and allow the one-time seal migration first"
+            )
         write_seal()
         emit_identity_status("REUSED")
         return
+
+    if rotation_id:
+        raise SystemExit(
+            "FATAL: SUBSCRIPTION_TOKEN_ROTATE_ID is only valid after the persistent identity "
+            "has been initialized and sealed"
+        )
 
     if complete:
         write_seal()

@@ -4,8 +4,8 @@
 The token is an identity primitive on the persistent volume. Railway endpoints
 are runtime state and may change between deployments. This contract verifies
 that the token remains sealed to the persistent identity while the served
-subscription exactly follows the current deployment endpoints, without printing
-any UUID, key, short ID, or token.
+subscription and subscription URL exactly follow the current deployment
+endpoints, without printing any UUID, key, short ID, or token.
 """
 import base64
 import hashlib
@@ -22,6 +22,7 @@ D = Path(os.environ.get("DATA_DIR", "/data"))
 TOKEN_FILE = D / "subscription_token.txt"
 SEAL_FILE = D / "identity-integrity.json"
 SUB_FILE = D / "subscription.txt"
+SUB_URL_FILE = D / "subscription_url.txt"
 RUNTIME_FILE = D / "runtime.json"
 
 # Gateway startup and HTTP route readiness are not atomic. Keep the contract
@@ -101,6 +102,16 @@ def validate_lines(lines, runtime):
     return expected, public, tcp_host, tcp_port
 
 
+def validate_subscription_url(token: str, public: str) -> None:
+    """The local subscription URL file is a required subscription artifact."""
+    if not SUB_URL_FILE.is_file():
+        fail("SUBSCRIPTION_URL_FILE_MISSING")
+    expected = f"https://{public}/sub/{token}"
+    actual = read(SUB_URL_FILE)
+    if actual != expected:
+        fail("SUBSCRIPTION_URL_FILE_MISMATCH")
+
+
 def local_subscription_request(url: str):
     """Fetch /sub with bounded readiness retries and safe diagnostics."""
     last_status = None
@@ -175,6 +186,7 @@ def main():
         fail("RUNTIME_JSON_INVALID")
     lines = [x.strip() for x in SUB_FILE.read_text().splitlines() if x.strip()]
     expected, public, tcp_host, tcp_port = validate_lines(lines, runtime)
+    validate_subscription_url(token, public)
 
     # Contract version is derived only from non-secret subscription semantics.
     contract_material = {
@@ -206,6 +218,7 @@ def main():
     print("SUBSCRIPTION_TOKEN_STATE=REUSED")
     print("SUBSCRIPTION_TOKEN_SEALED=PASS")
     print("SUBSCRIPTION_TOKEN_SECRET=REDACTED")
+    print("SUBSCRIPTION_URL_FILE=PASS")
     print("SUBSCRIPTION_HTTP_LOCAL=PASS")
     print("SUBSCRIPTION_ENDPOINT_CONTRACT=PASS")
     print(f"SUBSCRIPTION_VERSION={version}")

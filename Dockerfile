@@ -30,7 +30,7 @@ RUN set -eu; \
     check subscription_contract_present test -f /opt/xray/scripts/subscription-contract.py; \
     check persistent_volume_guard grep -q 'not a mounted persistent volume' /opt/xray/scripts/identity-init.py; \
     check identity_reuse grep -q 'emit_identity_status("REUSED")' /opt/xray/scripts/identity-init.py; \
-    check identity_fail_closed grep -q 'refusing to regenerate identity' /opt/xray/scripts/identity-init.py; \
+    check identity_fail_closed grep -q 'refusing to rotate identity' /opt/xray/scripts/identity-init.py; \
     check identity_integrity_seal grep -q 'identity-integrity.json' /opt/xray/scripts/identity-init.py; \
     check subscription_token_sealed grep -q 'TOKEN_SEAL_MISMATCH' /opt/xray/scripts/subscription-contract.py; \
     check subscription_http_contract grep -q 'SUBSCRIPTION_HTTP_LOCAL=PASS' /opt/xray/scripts/subscription-contract.py; \
